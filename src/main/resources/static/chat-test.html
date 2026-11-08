@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Meeting Chat and Video Call</title>
+    <script src="https://cdn.jsdelivr.net/npm/@stomp/stompjs@7/bundles/stomp.umd.min.js"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; max-width: 900px; margin: 30px auto; padding: 0 16px; background: #f5f7fb; color: #222; }
+        .card { background: white; padding: 22px; margin-bottom: 18px; border-radius: 12px; border: 1px solid #ddd; }
+        input, button { width: 100%; padding: 12px; margin: 7px 0; border-radius: 6px; border: 1px solid #ccc; font-size: 15px; }
+        button { background: #2563eb; color: white; border: none; cursor: pointer; }
+        button:disabled { opacity: .5; cursor: not-allowed; }
+        .secondary { background: #555; }
+        .danger { background: #b91c1c; }
+        .controls { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+        .videos { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+        video { width: 100%; min-height: 180px; background: #111827; border-radius: 8px; object-fit: cover; }
+        #messages { height: 240px; overflow-y: auto; border: 1px solid #ddd; padding: 12px; border-radius: 6px; background: #fafafa; overflow-wrap: anywhere; }
+        .message { padding: 8px; margin-bottom: 8px; background: #e8efff; border-radius: 6px; }
+        .muted { color: #666; font-size: 13px; }
+        #chatSection { display: none; }
+        #status { font-weight: bold; }
+        #participants { display: grid; gap: 8px; }
+        .participant { display: flex; align-items: center; gap: 12px; padding: 10px; border: 1px solid #ddd; border-radius: 8px; }
+        .participant-info { flex: 1; min-width: 0; }
+        .participant button { width: auto; min-width: 100px; margin: 0; }
+        #startCallButton { display: none; }
+        #status { font-weight: bold; }
+        h2, h3 { margin-top: 0; }
+        @media (max-width: 600px) { .videos { grid-template-columns: 1fr; } .controls { grid-template-columns: 1fr; } }
+    </style>
+</head>
+<body>
+<h2>Meeting Chat and Video Call</h2>
+
+<section class="card" id="loginSection">
+    <h3>Sign in</h3>
+    <form id="loginForm">
+        <label for="email">Email address</label>
+        <input id="email" type="email" autocomplete="username" placeholder="you@example.com" required>
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password" placeholder="Enter your password" required>
+        <button id="loginButton" type="submit">Sign in</button>
+    </form>
+    <p id="loginStatus" class="muted"></p>
+</section>
+
+<section class="card" id="chatSection">
+    <p>Signed in as: <strong id="userEmail"></strong></p>
+    <button id="logoutButton" class="secondary">Sign out</button>
+    <hr>
+    <label for="meetingCode">Meeting code</label>
+    <input id="meetingCode" placeholder="Enter meeting code">
+    <button id="connectButton">Connect to meeting</button>
+    <button id="disconnectButton" class="secondary" disabled>Disconnect</button>
+    <p>Status: <span id="status">Disconnected</span></p>
+</section>
+
+<section class="card" id="callSection" style="display:none">
+    <h3>Audio / Video Call</h3>
+    <p class="muted">Both users must be logged in, connected to the same meeting, and have joined it through the meeting API.</p>
+    <h4>Participants</h4>
+    <p class="muted">Choose a participant below to start a call. Your own account will not have a Call button.</p>
+    <button id="refreshParticipantsButton" class="secondary" disabled>Refresh participants</button>
+    <div id="participants" aria-live="polite"><p class="muted">Connect to a meeting to load participants.</p></div>
+    <div class="videos">
+        <div>
+            <strong>Your video</strong>
+            <video id="localVideo" autoplay playsinline muted></video>
+        </div>
+        <div>
+            <strong>Remote video</strong>
+            <video id="remoteVideo" autoplay playsinline></video>
+        </div>
+    </div>
+    <div class="controls">
+        <button id="startCallButton" disabled>Start call</button>
+        <button id="toggleMicButton" class="secondary" disabled>Mute microphone</button>
+        <button id="toggleCameraButton" class="secondary" disabled>Turn camera off</button>
+    </div>
+    <button id="endCallButton" class="danger" disabled>End call</button>
+    <p id="callStatus" class="muted" aria-live="polite">Not in a call.</p>
+</section>
+
+<section class="card" id="messagesSection" style="display:none">
+    <h3>Messages</h3>
+    <div id="messages" aria-live="polite"></div>
+    <form id="messageForm">
+        <label for="message">Your message</label>
+        <input id="message" maxlength="2000" placeholder="Type a message..." autocomplete="off" required>
+        <button id="sendButton" disabled>Send message</button>
+    </form>
+</section>
+
+<script>
+    let accessToken = null;
+    let client = null;
+    let subscription = null;
+    let signalingSubscription = null;
+    let connectedMeetingCode = null;
+    let localStream = null;
+    let peerConnection = null;
+    let remoteUserId = null;
+    let pendingIceCandidates = [];
+    let micEnabled = true;
+    let cameraEnabled = true;
+
+    const loginSection = document.getElementById("loginSection");
+    const chatSection = document.getElementById("chatSection");
+    const callSection = document.getElementById("callSection");
+    const messagesSection = document.getElementById("messagesSection");
+    const loginStatus = document.getElementById("loginStatus");
+    const status = document.getElementById("status");
+    const messages = document.getElementById("messages");
+    const participantsElement = document.getElementById("participants");
+    const refreshParticipantsButton = document.getElementById("refreshParticipantsButton");
+    const callStatus = document.getElementById("callStatus");
+    const loginButton = document.getElementById("loginButton");
+    const connectButton = document.getElementById("connectButton");
+    const disconnectButton = document.getElementById("disconnectButton");
+    const sendButton = document.getElementById("sendButton");
+    const startCallButton = document.getElementById("startCallButton");
+    const endCallButton = document.getElementById("endCallButton");
+    const toggleMicButton = document.getElementById("toggleMicButton");
+    const toggleCameraButton = document.getElementById("toggleCameraButton");
+    const localVideo = document.getElementById("localVideo");
+    const remoteVideo = document.getElementById("remoteVideo");
+
+    function showMessage(text) {
+        const item = document.createElement("div");
+        item.className = "message";
+        item.textContent = text;
+        messages.appendChild(item);
+        messages.scrollTop = messages.scrollHeight;
+    }
+
+    function setCallStatus(text) {
+        callStatus.textContent = text;
+    }
+
+    function publishSignal(signal) {
+        if (!client || !client.connected) {
+            throw new Error("WebSocket is not connected.");
+        }
+        client.publish({
+            destination: "/app/webrtc.signal",
+            body: JSON.stringify({
+                meetingCode: connectedMeetingCode,
+                targetUserId: Number(signal.targetUserId),
+                type: signal.type,
+                sdp: signal.sdp ?? null,
+                candidate: signal.candidate ?? null,
+                sdpMid: signal.sdpMid ?? null,
+                sdpMLineIndex: signal.sdpMLineIndex ?? null
+            })
+        });
+    }
+
+    async function getLocalMedia() {
+        if (localStream) return localStream;
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            throw new Error("Camera/microphone access is unavailable. Use localhost or HTTPS in a supported browser.");
+        }
+        localStream = await navigator.mediaDevices.getUserMedia({
+            audio: true,
+            video: true
+        });
+        localVideo.srcObject = localStream;
+        toggleMicButton.disabled = false;
+        toggleCameraButton.disabled = false;
+        return localStream;
+    }
+
+    function createPeerConnection(targetId) {
+        if (peerConnection) {
+            peerConnection.close();
+        }
+        pendingIceCandidates = [];
+        remoteUserId = Number(targetId);
+
+        // Diagnostic configuration: TURN-only to verify the relay path.
+        // Replace TURN_PASSWORD_HERE with the SAME new strong password configured in turnserver.conf.
+        peerConnection = new RTCPeerConnection({
+            iceServers: [
+                {
+                    urls: "turn:3.106.222.216:3478?transport=udp",
+                    username: "meetinguser",
+                    credential: "3"
+                },
+                {
+                    urls: "turn:3.106.222.216:3478?transport=tcp",
+                    username: "meetinguser",
+                    credential: "3"
+                }
+            ],
+            // Keep relay-only temporarily so the test proves whether TURN works.
+            iceTransportPolicy: "relay"
+        });
+
+        peerConnection.addEventListener("icecandidateerror", event => {
+            console.error("ICE candidate error:", {
+                url: event.url,
+                code: event.errorCode,
+                text: event.errorText
+            });
+        });
+        peerConnection.addEventListener("icegatheringstatechange", () => {
+            console.log("ICE gathering state:", peerConnection.iceGatheringState);
+        });
+
+        if (!localStream) throw new Error("Camera and microphone are not ready.");
+        localStream.getTracks().forEach(track => {
+            peerConnection.addTrack(track, localStream);
+        });
+
+        peerConnection.ontrack = async event => {
+            console.log("Remote track received:", event.track.kind,
+                "enabled:", event.track.enabled,
+                "readyState:", event.track.readyState);
+
+            if (event.streams && event.streams[0]) {
+                remoteVideo.srcObject = event.streams[0];
+            } else {
+                if (!remoteVideo.srcObject) {
+                    remoteVideo.srcObject = new MediaStream();
+                }
+                remoteVideo.srcObject.addTrack(event.track);
+            }
+
+            try {
+                await remoteVideo.play();
+                console.log("Remote media playback started.");
+            } catch (error) {
+                console.error("Remote media playback failed:", error);
+            }
+        };
+
+        peerConnection.onicecandidate = event => {
+            if (!event.candidate || !remoteUserId) return;
+            try {
+                publishSignal({
+                    targetUserId: remoteUserId,
+                    type: "ICE_CANDIDATE",
+                    candidate: event.candidate.candidate,
+                    sdpMid: event.candidate.sdpMid,
+                    sdpMLineIndex: event.candidate.sdpMLineIndex
+                });
+            } catch (error) {
+                setCallStatus("Could not send ICE candidate: " + error.message);
+            }
+        };
+
+        peerConnection.onconnectionstatechange = () => {
+            if (!peerConnection) return;
+            const state = peerConnection.connectionState;
+            console.log("Peer connection state:", state);
+            setCallStatus("Call connection: " + state);
+            if (state === "failed") {
+                setCallStatus("Connection failed. Check TURN reachability and browser Console.");
+            }
+        };
+
+        peerConnection.oniceconnectionstatechange = () => {
+            if (!peerConnection) return;
+            const state = peerConnection.iceConnectionState;
+            console.log("ICE connection state:", state);
+            if (state === "connected" || state === "completed") {
+                setCallStatus("ICE connected. Checking remote media...");
+            }
+        };
+
+        endCallButton.disabled = false;
+    }
+
+    async function addRemoteIceCandidate(data) {
+        const candidate = new RTCIceCandidate({
+            candidate: data.candidate,
+            sdpMid: data.sdpMid,
+            sdpMLineIndex: data.sdpMLineIndex
+        });
+        if (!peerConnection || !peerConnection.remoteDescription) {
+            pendingIceCandidates.push(candidate);
+            return;
+        }
+        await peerConnection.addIceCandidate(candidate);
+    }
+
+    async function flushPendingIceCandidates() {
+        while (pendingIceCandidates.length && peerConnection && peerConnection.remoteDescription) {
+            await peerConnection.addIceCandidate(pendingIceCandidates.shift());
+        }
+    }
+
+    async function handleSignal(data) {
+        try {
+            if (!data || data.meetingCode !== connectedMeetingCode) return;
+
+            if (data.type === "HANGUP") {
+                closeCall(false);
+                setCallStatus((data.senderName || "The other participant") + " ended the call.");
+                return;
+            }
+
+            if (data.type === "OFFER") {
+                if (peerConnection) {
+                    setCallStatus("Incoming call received. End the current call before answering another.");
+                    return;
+                }
+                remoteUserId = Number(data.senderId);
+                await getLocalMedia();
+                createPeerConnection(remoteUserId);
+                await peerConnection.setRemoteDescription(
+                    new RTCSessionDescription({ type: "offer", sdp: data.sdp })
+                );
+                await flushPendingIceCandidates();
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer);
+                publishSignal({
+                    targetUserId: remoteUserId,
+                    type: "ANSWER",
+                    sdp: answer.sdp
+                });
+                setCallStatus("Answer sent. Connecting audio/video...");
+                return;
+            }
+
+            if (data.type === "ANSWER") {
+                if (!peerConnection) return;
+                await peerConnection.setRemoteDescription(
+                    new RTCSessionDescription({ type: "answer", sdp: data.sdp })
+                );
+                await flushPendingIceCandidates();
+                setCallStatus("Answer received. Connecting audio/video...");
+                return;
+            }
+
+            if (data.type === "ICE_CANDIDATE") {
+                // Ignore candidates from anyone other than the current call peer.
+                if (remoteUserId && Number(data.senderId) !== Number(remoteUserId)) return;
+                await addRemoteIceCandidate(data);
+            }
+        } catch (error) {
+            console.error("WebRTC signaling error:", error);
+            setCallStatus("Call error: " + error.message);
+        }
+    }
+
+    async function startCall(targetId) {
+        targetId = Number(targetId);
+        if (!client || !client.connected || !connectedMeetingCode) {
+            setCallStatus("Connect to the meeting first.");
+            return;
+        }
+        if (!Number.isInteger(targetId) || targetId <= 0) {
+            setCallStatus("Choose a valid meeting participant.");
+            return;
+        }
+        if (peerConnection) {
+            setCallStatus("End the current call before starting another.");
+            return;
+        }
+
+        startCallButton.disabled = true;
+        try {
+            await getLocalMedia();
+            createPeerConnection(targetId);
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+            publishSignal({
+                targetUserId: targetId,
+                type: "OFFER",
+                sdp: offer.sdp
+            });
+            setCallStatus("Call offer sent. Waiting for the other participant...");
+        } catch (error) {
+            console.error(error);
+            setCallStatus("Could not start call: " + error.message);
+            closeCall(false);
+        } finally {
+            startCallButton.disabled = false;
+        }
+    }
+
+    async function loadParticipants() {
+        if (!accessToken || !connectedMeetingCode) return;
+        participantsElement.replaceChildren();
+        const loading = document.createElement("p");
+        loading.className = "muted";
+        loading.textContent = "Loading participants...";
+        participantsElement.appendChild(loading);
+        refreshParticipantsButton.disabled = true;
+
+        try {
+            const response = await fetch(
+                "/api/meetings/" + encodeURIComponent(connectedMeetingCode) + "/participants",
+                { headers: { Authorization: "Bearer " + accessToken } }
+            );
+            if (!response.ok) {
+                throw new Error("Could not load participants (HTTP " + response.status + ").");
+            }
+            const participants = await response.json();
+            participantsElement.replaceChildren();
+
+            if (!Array.isArray(participants) || participants.length === 0) {
+                const empty = document.createElement("p");
+                empty.className = "muted";
+                empty.textContent = "No active participants were returned. Make sure you have joined the meeting.";
+                participantsElement.appendChild(empty);
+                return;
+            }
+
+            let otherParticipantCount = 0;
+            participants.forEach(participant => {
+                const row = document.createElement("div");
+                row.className = "participant";
+                const info = document.createElement("div");
+                info.className = "participant-info";
+                const name = document.createElement("strong");
+                name.textContent = participant.name || "Participant";
+                const details = document.createElement("div");
+                details.className = "muted";
+                details.textContent = participant.currentUser
+                    ? "You" + (participant.role ? " · " + participant.role : "")
+                    : (participant.role || "Participant");
+                info.append(name, details);
+                row.appendChild(info);
+
+                if (!participant.currentUser && Number.isInteger(Number(participant.userId))) {
+                    const callButton = document.createElement("button");
+                    callButton.type = "button";
+                    callButton.textContent = "Call";
+                    callButton.disabled = !client || !client.connected || Boolean(peerConnection);
+                    callButton.addEventListener("click", () => startCall(participant.userId));
+                    row.appendChild(callButton);
+                    otherParticipantCount++;
+                }
+                participantsElement.appendChild(row);
+            });
+
+            if (otherParticipantCount === 0) {
+                const note = document.createElement("p");
+                note.className = "muted";
+                note.textContent = "No other active participants are available to call.";
+                participantsElement.appendChild(note);
+            }
+        } catch (error) {
+            participantsElement.replaceChildren();
+            const failure = document.createElement("p");
+            failure.className = "muted";
+            failure.textContent = error.message;
+            participantsElement.appendChild(failure);
+        } finally {
+            refreshParticipantsButton.disabled = !client || !client.connected;
+        }
+    }
+
+    function closeCall(notifyPeer) {
+        if (notifyPeer && remoteUserId && client && client.connected && connectedMeetingCode) {
+            try {
+                publishSignal({ targetUserId: remoteUserId, type: "HANGUP" });
+            } catch (error) {
+                console.warn("Could not notify peer about hangup:", error);
+            }
+        }
+        if (peerConnection) {
+            peerConnection.onicecandidate = null;
+            peerConnection.ontrack = null;
+            peerConnection.close();
+            peerConnection = null;
+        }
+        if (localStream) {
+            localStream.getTracks().forEach(track => track.stop());
+            localStream = null;
+        }
+        localVideo.srcObject = null;
+        remoteVideo.srcObject = null;
+        remoteUserId = null;
+        pendingIceCandidates = [];
+        micEnabled = true;
+        cameraEnabled = true;
+        toggleMicButton.textContent = "Mute microphone";
+        toggleCameraButton.textContent = "Turn camera off";
+        toggleMicButton.disabled = true;
+        toggleCameraButton.disabled = true;
+        endCallButton.disabled = true;
+        startCallButton.disabled = !client || !client.connected;
+    }
+
+    document.getElementById("loginForm").addEventListener("submit", async event => {
+        event.preventDefault();
+        loginButton.disabled = true;
+        loginStatus.textContent = "Signing in...";
+        try {
+            const response = await fetch("/api/auth/login", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    email: document.getElementById("email").value.trim(),
+                    password: document.getElementById("password").value
+                })
+            });
+            if (!response.ok) {
+                throw new Error(response.status === 401
+                    ? "Invalid email or password."
+                    : "Sign-in failed (HTTP " + response.status + ").");
+            }
+            const data = await response.json();
+            if (!data.accessToken) throw new Error("Login response did not contain an access token.");
+            accessToken = data.accessToken;
+            document.getElementById("userEmail").textContent =
+                document.getElementById("email").value.trim();
+            document.getElementById("password").value = "";
+            loginSection.style.display = "none";
+            chatSection.style.display = "block";
+            callSection.style.display = "block";
+            messagesSection.style.display = "block";
+            loginStatus.textContent = "";
+        } catch (error) {
+            loginStatus.textContent = error.message;
+        } finally {
+            loginButton.disabled = false;
+        }
+    });
+
+    connectButton.addEventListener("click", () => {
+        const meetingCode = document.getElementById("meetingCode").value.trim().toUpperCase();
+        if (!accessToken) { status.textContent = "Please sign in first."; return; }
+        if (!meetingCode) { status.textContent = "Enter a meeting code."; return; }
+
+        connectButton.disabled = true;
+        status.textContent = "Connecting...";
+        client = new StompJs.Client({
+            brokerURL: (window.location.protocol === "https:" ? "wss://" : "ws://")
+                + window.location.host + "/ws",
+            connectHeaders: { Authorization: "Bearer " + accessToken },
+            reconnectDelay: 0,
+            onConnect: async () => {
+                connectedMeetingCode = meetingCode;
+                status.textContent = "Connected";
+                disconnectButton.disabled = false;
+                sendButton.disabled = false;
+                startCallButton.disabled = true;
+                refreshParticipantsButton.disabled = false;
+
+                subscription = client.subscribe("/topic/meetings/" + meetingCode, frame => {
+                    try {
+                        const data = JSON.parse(frame.body);
+                        showMessage(data.senderName + ": " + data.message + " (" + data.sentAt + ")");
+                    } catch (error) {
+                        showMessage("Received an unreadable message.");
+                    }
+                });
+
+                signalingSubscription = client.subscribe("/user/queue/webrtc", frame => {
+                    try {
+                        handleSignal(JSON.parse(frame.body));
+                    } catch (error) {
+                        console.error("Could not parse signaling message:", error);
+                    }
+                });
+                showMessage("Connected to meeting " + meetingCode);
+                await loadParticipants();
+            },
+            onStompError: frame => {
+                status.textContent = "STOMP error";
+                showMessage("STOMP error: " + (frame.headers.message || frame.body || "Unknown error"));
+                connectButton.disabled = false;
+                sendButton.disabled = true;
+                startCallButton.disabled = true;
+            },
+            onWebSocketError: () => {
+                status.textContent = "WebSocket error";
+                showMessage("WebSocket error. Check the Spring Boot console.");
+                connectButton.disabled = false;
+                sendButton.disabled = true;
+                startCallButton.disabled = true;
+            },
+            onWebSocketClose: () => {
+                setChatDisconnected();
+            }
+        });
+        client.activate();
+    });
+
+    document.getElementById("messageForm").addEventListener("submit", event => {
+        event.preventDefault();
+        const text = document.getElementById("message").value.trim();
+        if (!client || !client.connected || !connectedMeetingCode || !text) return;
+        client.publish({
+            destination: "/app/chat.send",
+            body: JSON.stringify({ meetingCode: connectedMeetingCode, message: text })
+        });
+        document.getElementById("message").value = "";
+    });
+
+    startCallButton.addEventListener("click", () => {
+        setCallStatus("Choose a participant from the list above to call.");
+    });
+    refreshParticipantsButton.addEventListener("click", loadParticipants);
+    endCallButton.addEventListener("click", () => {
+        closeCall(true);
+        setCallStatus("Call ended.");
+    });
+
+    toggleMicButton.addEventListener("click", () => {
+        if (!localStream) return;
+        micEnabled = !micEnabled;
+        localStream.getAudioTracks().forEach(track => track.enabled = micEnabled);
+        toggleMicButton.textContent = micEnabled ? "Mute microphone" : "Unmute microphone";
+    });
+
+    toggleCameraButton.addEventListener("click", () => {
+        if (!localStream) return;
+        cameraEnabled = !cameraEnabled;
+        localStream.getVideoTracks().forEach(track => track.enabled = cameraEnabled);
+        toggleCameraButton.textContent = cameraEnabled ? "Turn camera off" : "Turn camera on";
+    });
+
+    function setChatDisconnected() {
+        status.textContent = "Disconnected";
+        connectButton.disabled = false;
+        disconnectButton.disabled = true;
+        sendButton.disabled = true;
+        startCallButton.disabled = true;
+        refreshParticipantsButton.disabled = true;
+        participantsElement.replaceChildren();
+        const note = document.createElement("p");
+        note.className = "muted";
+        note.textContent = "Connect to a meeting to load participants.";
+        participantsElement.appendChild(note);
+        connectedMeetingCode = null;
+    }
+
+    disconnectButton.addEventListener("click", async () => {
+        closeCall(true);
+        if (client) await client.deactivate();
+        subscription = null;
+        signalingSubscription = null;
+        client = null;
+        setChatDisconnected();
+        setCallStatus("Disconnected from meeting.");
+    });
+
+    document.getElementById("logoutButton").addEventListener("click", async () => {
+        closeCall(true);
+        if (client) await client.deactivate();
+        client = null;
+        subscription = null;
+        signalingSubscription = null;
+        accessToken = null;
+        connectedMeetingCode = null;
+        document.getElementById("email").value = "";
+        document.getElementById("password").value = "";
+        document.getElementById("meetingCode").value = "";
+        messages.replaceChildren();
+        setChatDisconnected();
+        chatSection.style.display = "none";
+        callSection.style.display = "none";
+        messagesSection.style.display = "none";
+        loginSection.style.display = "block";
+        loginStatus.textContent = "You have signed out.";
+    });
+
+    window.addEventListener("beforeunload", () => {
+        if (localStream) localStream.getTracks().forEach(track => track.stop());
+        if (peerConnection) peerConnection.close();
+    });
+</script>
+</body>
+</html>
